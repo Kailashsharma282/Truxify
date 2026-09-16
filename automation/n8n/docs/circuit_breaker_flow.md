@@ -15,3 +15,5 @@ graph TD
 - Real-time 1-minute velocity monitoring
 - Automated call execution to `TruxifyEscrow.pause()`
 - Alert notifications dispatched to system admins
+
+The workflow records the distributed backend pause first, then calls `/api/internal/pause-escrow-onchain`. The API waits for the `TruxifyEscrow.pause()` transaction and confirms the contract `paused()` view before reporting success. RPC, signer, receipt, or confirmation failures keep the workflow failed for operator alerting.

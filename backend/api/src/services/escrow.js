@@ -69,6 +69,8 @@ const ESCROW_ABI = [
   'function raiseDispute(uint256 bookingId) external',
   'function resolveDispute(uint256 bookingId, uint256 driverAmount) external',
   'function resolveDisputeTimeout(uint256 bookingId) external',
+  'function pause() external',
+  'function paused() external view returns (bool)',
   'function bookings(uint256 bookingId) external view returns (address customer, address driver, uint256 amount, uint8 status, bool paid, bool started, uint256 createdAt, uint256 disputedAt)'
 ]
 
@@ -171,6 +173,22 @@ export async function validateEscrowSetup () {
 
   return true
   });
+}
+
+export async function pauseEscrowContract () {
+  if (!escrowContract) {
+    throw new Error('Escrow contract is not configured');
+  }
+
+  const transaction = await withTimeout(escrowContract.pause());
+  const receipt = await withTimeout(transaction.wait());
+  const paused = await withTimeout(escrowContract.paused());
+
+  if (!paused) {
+    throw new Error('Escrow pause transaction was mined but contract remains unpaused');
+  }
+
+  return { txHash: receipt.hash, paused: true };
 }
 
 /**
