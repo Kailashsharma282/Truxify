@@ -72,6 +72,11 @@ describe('services/ml.js Unit Tests', () => {
       expect(() => guardMlApiKey()).toThrow(/ML_API_KEY is not configured/);
     });
 
+    it('throws 503 error when ML_API_KEY is whitespace-only', () => {
+      process.env.ML_API_KEY = '   ';
+      expect(() => guardMlApiKey()).toThrow(/ML_API_KEY is not configured/);
+    });
+
     it('does not throw when ML_API_KEY is set', () => {
       process.env.ML_API_KEY = 'valid-key';
       expect(() => guardMlApiKey()).not.toThrow();
@@ -108,8 +113,25 @@ describe('services/ml.js Unit Tests', () => {
       });
     });
 
+    it('trims leading and trailing whitespace from ML_API_KEY in X-API-Key header', () => {
+      process.env.ML_API_KEY = '  my-secret-key  ';
+      const headers = getHeaders();
+      expect(headers).toEqual({
+        'Content-Type': 'application/json',
+        'X-API-Key': 'my-secret-key',
+      });
+    });
+
     it('includes only Content-Type when ML_API_KEY is unset', () => {
       delete process.env.ML_API_KEY;
+      const headers = getHeaders();
+      expect(headers).toEqual({
+        'Content-Type': 'application/json',
+      });
+    });
+
+    it('includes only Content-Type when ML_API_KEY is whitespace-only', () => {
+      process.env.ML_API_KEY = '   ';
       const headers = getHeaders();
       expect(headers).toEqual({
         'Content-Type': 'application/json',
@@ -157,7 +179,7 @@ describe('services/ml.js Unit Tests', () => {
         text: async () => 'Server Error',
       };
       await expect(handleResponse(mockRes, 'http://test/fail', 'GET')).rejects.toThrow(
-        /Request failed \(500\): GET http:\/\/test\/fail - Server Error/
+        /\[ML\] Request failed: GET http:\/\/test\/fail 500 - Server Error/
       );
     });
 
@@ -187,9 +209,9 @@ describe('services/ml.js Unit Tests', () => {
       expect(parseWeightKg('1.2 t')).toBe(1200);
     });
 
-    it('returns NaN for invalid weight strings', () => {
-      expect(Number.isNaN(parseWeightKg('heavy load'))).toBe(true);
-      expect(Number.isNaN(parseWeightKg(null))).toBe(true);
+    it('returns null for invalid weight strings', () => {
+      expect(parseWeightKg('heavy load')).toBeNull();
+      expect(parseWeightKg(null)).toBeNull();
     });
 
     it('parseWeightKgSafe returns parsed number or null on invalid', () => {
@@ -369,6 +391,182 @@ describe('services/ml.js Unit Tests', () => {
       await expect(
         predictPrice({ distanceKm: 1000, cargoWeightKg: 20000, trafficMultiplier: 2.5 })
       ).rejects.toThrow(/Surge-adjusted price prediction rejected by validator|Invalid prediction/);
+    });
+
+    // Regression tests for GitHub issue #13490
+    // Verify min_price/max_price are only included when valid finite numbers
+    it('omits min_price from returned object when raw response has undefined min_price', async () => {
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            max_price: 2000,
+            currency: 'INR',
+          }),
+      });
+
+      const result = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(result.estimated_price).toBe(1500);
+      // min_price should be computed from default band (15% below) since raw had no min_price
+      expect(result.min_price).toBe(1275); // 1500 * 0.85
+      expect(result.max_price).toBe(2000);
+    });
+
+    it('omits max_price from returned object when raw response has undefined max_price', async () => {
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            min_price: 1200,
+            currency: 'INR',
+          }),
+      });
+
+      const result = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(result.estimated_price).toBe(1500);
+      expect(result.min_price).toBe(1200);
+      // max_price should be computed from default band (15% above) since raw had no max_price
+      expect(result.max_price).toBe(1725); // 1500 * 1.15
+    });
+
+    it('omits non-finite min_price (NaN, Infinity, -Infinity) from returned object', async () => {
+      // Test NaN
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            min_price: NaN,
+            max_price: 2000,
+            currency: 'INR',
+          }),
+      });
+
+      const resultNaN = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(resultNaN.estimated_price).toBe(1500);
+      // min_price should fall back to default band since NaN is not finite
+      expect(resultNaN.min_price).toBe(1275); // 1500 * 0.85
+      expect(resultNaN.max_price).toBe(2000);
+
+      // Test Infinity
+      priceCache.clear();
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            min_price: Infinity,
+            max_price: 2000,
+            currency: 'INR',
+          }),
+      });
+
+      const resultInf = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(resultInf.min_price).toBe(1275); // falls back to default
+
+      // Test -Infinity
+      priceCache.clear();
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            min_price: -Infinity,
+            max_price: 2000,
+            currency: 'INR',
+          }),
+      });
+
+      const resultNegInf = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(resultNegInf.min_price).toBe(1275); // falls back to default
+    });
+
+    it('omits non-finite max_price (NaN, Infinity, -Infinity) from returned object', async () => {
+      // Test NaN
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            min_price: 1200,
+            max_price: NaN,
+            currency: 'INR',
+          }),
+      });
+
+      const resultNaN = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(resultNaN.estimated_price).toBe(1500);
+      expect(resultNaN.min_price).toBe(1200);
+      // max_price should fall back to default band since NaN is not finite
+      expect(resultNaN.max_price).toBe(1725); // 1500 * 1.15
+
+      // Test Infinity
+      priceCache.clear();
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            min_price: 1200,
+            max_price: Infinity,
+            currency: 'INR',
+          }),
+      });
+
+      const resultInf = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(resultInf.max_price).toBe(1725); // falls back to default
+
+      // Test -Infinity
+      priceCache.clear();
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 1500,
+            min_price: 1200,
+            max_price: -Infinity,
+            currency: 'INR',
+          }),
+      });
+
+      const resultNegInf = await predictPrice({ distanceKm: 30, cargoWeightKg: 500 });
+      expect(resultNegInf.max_price).toBe(1725); // falls back to default
+    });
+
+    it('retains valid finite min_price and max_price in returned object', async () => {
+      globalThis.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            estimated_price: 2500,
+            min_price: 2000,
+            max_price: 3000,
+            currency: 'INR',
+            confidence: 0.9,
+          }),
+      });
+
+      const result = await predictPrice({
+        distanceKm: 50,
+        cargoWeightKg: 1500,
+        trafficMultiplier: 1.2,
+      });
+
+      // Adjusted price: 2500 * 1.2 = 3000 INR
+      expect(result.estimated_price).toBe(3000);
+      expect(result.min_price).toBe(2400); // 2000 * 1.2
+      expect(result.max_price).toBe(3600); // 3000 * 1.2
     });
   });
 

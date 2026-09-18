@@ -43,6 +43,7 @@ class GNNRouteModel(nn.Module):
             self.conv2 = GATConv(hidden_dim, hidden_dim, heads=4, concat=True)
         self.conv3 = SAGEConv(hidden_dim * 4, hidden_dim)
         
+        
         # Attention mechanism
         self.attention = nn.MultiheadAttention(hidden_dim, num_heads=8)
         
@@ -99,16 +100,48 @@ class GNNRouteModel(nn.Module):
 RouteGNN = GNNRouteModel
 
 class GraphNetworkBuilder:
-    """Build road network graphs for GNN."""
-    
+    """Build directed road network graphs for GNN route optimization."""
+
     def __init__(self):
-        """Initialize empty road network graph and feature mappings."""
-        self.graph = nx.Graph()
+        """Initialize a directed road network graph and feature mappings."""
+        self.graph = nx.DiGraph()
         self.node_features = {}
         self.edge_features = {}
-        
+        self.node_map = {}
+
+    def clear(self):
+        """Reset internal graph and feature structures."""
+        self.graph = nx.DiGraph()
+        self.node_features = {}
+        self.edge_features = {}
+        self.node_map = {}
+
+    def reset(self):
+        """Alias for clear()."""
+        self.clear()
+
     def build_road_network(self, nodes, edges):
-        """Build road network from nodes and edges"""
+        """Build road network from nodes and directed source-to-target edges.
+
+        Every invocation starts with a fresh nx.DiGraph instance to prevent
+        cross-request accumulation and graph contamination.
+        """
+        self.graph = nx.DiGraph()
+        self.node_features = {}
+        self.edge_features = {}
+        self.node_map = {}
+        """Build road network after validating every edge endpoint."""
+        node_ids = {node['id'] for node in nodes}
+        for edge in edges:
+            source = edge['source']
+            target = edge['target']
+            missing_endpoints = [
+                node_id for node_id in (source, target) if node_id not in node_ids
+            ]
+            if missing_endpoints:
+                missing = ', '.join(dict.fromkeys(missing_endpoints))
+                raise ValueError(f"Unknown edge endpoint(s): {missing}")
+
         # Add nodes
         for node in nodes:
             self.graph.add_node(
@@ -119,7 +152,7 @@ class GraphNetworkBuilder:
                 road_type=node.get('road_type', 'local'),
                 speed_limit=node.get('speed_limit', 50)
             )
-            
+
         # Add edges
         for edge in edges:
             self.graph.add_edge(
@@ -134,18 +167,19 @@ class GraphNetworkBuilder:
                 max_weight=edge.get('max_weight'),
                 max_height=edge.get('max_height')
             )
-            
+
         return self.graph
-    
-    def extract_features(self):
-        """Extract node and edge features"""
+
+    def extract_features(self, graph=None):
+        """Extract node and edge features from the given graph (or self.graph)."""
+        target_graph = graph if graph is not None else self.graph
         node_features = []
         edge_indices = []
         edge_features = []
-        
+
         # Node features
         node_map = {}
-        for i, (node, data) in enumerate(self.graph.nodes(data=True)):
+        for i, (node, data) in enumerate(target_graph.nodes(data=True)):
             node_map[node] = i
             features = [
                 data.get('lat', 0),
@@ -155,9 +189,9 @@ class GraphNetworkBuilder:
                 data.get('speed_limit', 50) / 100
             ]
             node_features.append(features)
-        
+
         # Edge features
-        for u, v, data in self.graph.edges(data=True):
+        for u, v, data in target_graph.edges(data=True):
             edge_indices.append([node_map[u], node_map[v]])
             edge_features.append([
                 data.get('distance', 0) / 100,
@@ -169,12 +203,22 @@ class GraphNetworkBuilder:
 
         self.node_map = node_map
 
+        if edge_indices:
+            edge_index = torch.tensor(
+                edge_indices, dtype=torch.long
+            ).t().contiguous()
+            edge_attr = torch.tensor(edge_features, dtype=torch.float)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0, GNN_EDGE_FEATURE_DIM), dtype=torch.float)
+
         return {
             'node_features': torch.tensor(node_features, dtype=torch.float),
-            'edge_indices': torch.tensor(edge_indices, dtype=torch.long).t().contiguous(),
-            'edge_features': torch.tensor(edge_features, dtype=torch.float)
+            'edge_indices': edge_index,
+            'edge_features': edge_attr,
+            'node_map': node_map
         }
-    
+
     def _road_type_encoding(self, road_type):
         """Encode road type to one-hot"""
         types = ['highway', 'arterial', 'collector', 'local', 'street']
@@ -182,37 +226,53 @@ class GraphNetworkBuilder:
         if road_type in types:
             encoding[types.index(road_type)] = 1
         return encoding
-    
-    def get_pytorch_data(self):
-        """Convert to PyTorch Geometric Data object"""
-        features = self.extract_features()
+
+    def get_pytorch_data(self, graph=None):
+        """Convert to PyTorch Geometric Data object for the given graph (or self.graph)."""
+        target_graph = graph if graph is not None else self.graph
+        features = self.extract_features(target_graph)
         data = Data(
             x=features['node_features'],
             edge_index=features['edge_indices'],
             edge_attr=features['edge_features']
         )
-        data.graph = self.graph
-        data.node_map = self.node_map
+        data.graph = target_graph
+        data.node_map = features.get('node_map', self.node_map)
         return data
 
 class RouteOptimizer:
     """GNN-based Route Optimizer"""
     
-    def __init__(self, model_path=None):
+    def __init__(self, model_path=None, allow_untrained=False):
         """Initialize RouteOptimizer with GNNRouteModel and hardware acceleration device."""
         self.model = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.is_trained = False
+        self.allow_untrained = allow_untrained
         
         if model_path:
             self.load_model(model_path)
         else:
             self.model = GNNRouteModel().to(self.device)
+            if self.allow_untrained:
+                logger.info("Route Optimizer initialized with untrained weights (dev mode allowed)")
+            else:
+                logger.warning("Route Optimizer initialized without trained weights. Call train() or load_model() before serving.")
         
         logger.info(f"✅ Route Optimizer initialized on {self.device}")
     
     def optimize_route(self, start_node, end_node, graph_data, objectives=['time', 'cost', 'fuel'], constraints=None):
         """Optimize route using GNN and constrained Dijkstra pathfinding."""
+        if not self.is_trained and not self.allow_untrained:
+            logger.error("Attempted route optimization on untrained model")
+            raise RuntimeError("GNN model is untrained. Load a trained checkpoint or enable dev mode.")
+
         try:
+            # Check node presence in graph
+            if not hasattr(graph_data, 'graph') or start_node not in graph_data.graph or end_node not in graph_data.graph:
+                logger.warning(f"Start ({start_node}) or End ({end_node}) node not found in graph")
+                return None
+
             # Convert to PyTorch Geometric
             data = graph_data.to(self.device)
 
@@ -222,6 +282,10 @@ class RouteOptimizer:
                 raise ValueError(
                     f"Node feature dim mismatch: model expects {self.model.input_dim}, got {data.x.shape[1]}"
                 )
+
+            # Ensure model is in eval mode so BatchNorm layers do not update running stats during inference
+            if self.model is not None:
+                self.model.eval()
 
             # Get node embeddings
             with torch.no_grad():
@@ -243,6 +307,8 @@ class RouteOptimizer:
 
             return self._build_route_result(route)
             
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"Route optimization failed: {e}")
             return None
@@ -296,7 +362,9 @@ class RouteOptimizer:
 
             return self._calculate_score(embeddings, u, v, objectives, graph_data, node_map)
 
-        max_time = constraints.get('max_time') or constraints.get('hos_limit')
+        max_time = constraints.get('max_time')
+        if max_time is None:
+            max_time = constraints.get('hos_limit')
         path = None
 
         if max_time is not None:
@@ -397,17 +465,23 @@ class RouteOptimizer:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
         criterion = nn.MSELoss()
         
+        avg_loss = 0.0
         for epoch in range(epochs):
             self.model.train()
-            total_loss = 0
+            total_loss = 0.0
             
             for data in train_data:
                 data = data.to(self.device)
                 optimizer.zero_grad()
                 
                 # Forward pass
-                out = self.model(data.x, data.edge_index, data.edge_attr, data.batch)
-                loss = criterion(out, data.y)
+                batch = getattr(data, 'batch', None)
+                edge_attr = getattr(data, 'edge_attr', None)
+                out = self.model(data.x, data.edge_index, edge_attr, batch)
+                target = getattr(data, 'y', None)
+                if target is None:
+                    target = torch.zeros_like(out)
+                loss = criterion(out, target)
                 
                 # Backward pass
                 loss.backward()
@@ -420,6 +494,8 @@ class RouteOptimizer:
             if epoch % 10 == 0:
                 logger.info(f"Epoch {epoch}: Loss = {avg_loss:.4f}")
         
+        self.is_trained = True
+        self.model.eval()
         return avg_loss
     
     def save_model(self, path='models/gnn_route.pth'):
@@ -432,23 +508,24 @@ class RouteOptimizer:
         self.model = GNNRouteModel().to(self.device)
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         self.model.eval()
+        self.is_trained = True
         logger.info(f"✅ Model loaded from {path}")
 
     def _edge_is_feasible(self, edge_data, constraints):
         """Return whether an edge satisfies the active hard route constraints."""
         if constraints.get('hazmat', False) and not edge_data.get('hazmat_allowed', True):
             return False
-
+        
         truck_weight = constraints.get('truck_weight') or constraints.get('weight')
         max_weight = edge_data.get('max_weight') or edge_data.get('weight_limit')
         if truck_weight is not None and max_weight is not None and truck_weight > max_weight:
             return False
-
+        
         truck_height = constraints.get('truck_height') or constraints.get('height')
         max_height = edge_data.get('max_height') or edge_data.get('height_limit')
         if truck_height is not None and max_height is not None and truck_height > max_height:
             return False
-
+        
         return True
 
     def _route_result_for_path(self, path, graph_data):
@@ -508,7 +585,7 @@ class RouteOptimizer:
         while queue:
             current_values, current_time, current_path = heapq.heappop(queue)
             current_node = current_path[-1]
-
+            
             if current_node != end:
                 for neighbor in graph_data.graph.neighbors(current_node):
                     if neighbor in current_path:
@@ -564,19 +641,12 @@ class RouteOptimizer:
         """Return a representative route together with the exact Pareto frontier."""
         objectives = ['time', 'cost', 'fuel']
         frontier = self._find_pareto_routes(start, end, graph_data, objectives, constraints)
-
         if not frontier:
             return None
-
         weights = {'time': 0.5, 'cost': 0.3, 'fuel': 0.2}
-        best_route = min(
-            frontier,
-            key=lambda candidate: sum(
-                weights[objective] * candidate[f'total_{objective}']
-                for objective in objectives
-            )
-        )
-
+        best_route = min(frontier, key=lambda candidate: sum(
+            weights[objective] * candidate[f'total_{objective}'] for objective in objectives
+        ))
         result = dict(best_route)
         result['pareto_routes'] = frontier
         result['pareto_count'] = len(frontier)
@@ -587,29 +657,24 @@ class RouteOptimizer:
         """Apply traffic updates and reroute through the current road network."""
         if not current_route:
             return current_route
-
         if graph_data is None or not hasattr(graph_data, 'graph'):
             logger.warning("Real-time rerouting requires graph_data; returning the updated current route")
             updated_route = [dict(edge) for edge in current_route]
             self._apply_traffic_to_route(updated_route, new_traffic_data)
             return updated_route
-
         graph = graph_data.graph.copy()
         edge_lookup = {}
         for u, v in graph.edges:
             edge_lookup[f"{u}-{v}"] = (u, v)
             edge_lookup[f"{v}-{u}"] = (u, v)
-
         changed = False
         updated_route = [dict(edge) for edge in current_route]
         for edge_id, update in new_traffic_data.items():
             if not isinstance(update, dict):
                 continue
-
             endpoints = edge_lookup.get(edge_id)
             if endpoints is None:
                 continue
-
             u, v = endpoints
             edge_attrs = graph[u][v]
             for field in ('time', 'cost', 'fuel', 'congestion'):
@@ -618,12 +683,9 @@ class RouteOptimizer:
                     if edge_attrs.get(field) != value:
                         edge_attrs[field] = value
                         changed = True
-
         self._apply_traffic_to_route(updated_route, new_traffic_data)
-
         if not changed:
             return updated_route
-
         builder = GraphNetworkBuilder()
         nodes = [
             {
@@ -653,18 +715,13 @@ class RouteOptimizer:
         ]
         builder.build_road_network(nodes, edges)
         updated_graph_data = builder.get_pytorch_data()
-
         start = current_route[0].get('from')
         end = current_route[-1].get('to')
         if start is None or end is None:
             return updated_route
-
         rerouted = self._reoptimize(
-            start,
-            end,
-            updated_graph_data,
-            objectives or ['time', 'cost', 'fuel'],
-            constraints
+            start, end, updated_graph_data,
+            objectives or ['time', 'cost', 'fuel'], constraints
         )
         return rerouted if rerouted is not None else updated_route
 

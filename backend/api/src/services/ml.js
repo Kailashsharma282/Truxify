@@ -18,40 +18,43 @@ const DEFAULT_TRUCK_MAX_WIDTH_M = 2.5;
 const DEFAULT_TRUCK_MAX_HEIGHT_M = 4;
 
 // Startup validation
-if (!process.env.ML_API_KEY) {
+const initialApiKey = (process.env.ML_API_KEY || '').trim();
+if (!initialApiKey) {
     logger.warn('[ML] WARNING: ML_API_KEY is not set. All ML API endpoints will return 503. Set ML_API_KEY in your environment.');
 }
 
 function guardMlApiKey() {
-  if (!process.env.ML_API_KEY) {
+  const apiKey = (process.env.ML_API_KEY || '').trim();
+  if (!apiKey) {
     throw new Error("[ML] ML_API_KEY is not configured. All ML endpoints will return 503. Set ML_API_KEY to enable ML features.");
   }
 }
 
 /**
  * Parse the free-text `weight` column of load_offers (e.g. '3 tonnes') into
- * kilograms. Returns NaN when the value cannot be interpreted.
+ * kilograms. Returns null when the value cannot be interpreted, consistent
+ * with the rest of the ML service API.
  */
 function parseWeightKg(weight) {
   if (weight == null || typeof weight === 'boolean' || Array.isArray(weight)) {
-    return NaN;
+    return null;
   }
   if (typeof weight === 'number') {
-    return Number.isFinite(weight) ? weight : NaN;
+    return Number.isFinite(weight) ? weight : null;
   }
   if (typeof weight !== 'string') {
-    return NaN;
+    return null;
   }
   const trimmed = weight.trim();
-  if (!trimmed) return NaN;
+  if (!trimmed) return null;
 
   const match = trimmed.toLowerCase().match(/([\d.]+)\s*(kg|tons?|tonnes?|t)\b/);
   if (!match) {
     const num = Number(trimmed);
-    return Number.isFinite(num) ? num : NaN;
+    return Number.isFinite(num) ? num : null;
   }
   const value = Number(match[1]);
-  if (!Number.isFinite(value)) return NaN;
+  if (!Number.isFinite(value)) return null;
   return match[2].toLowerCase() === 'kg' ? value : value * 1000;
 }
 
@@ -61,7 +64,7 @@ function parseWeightKgSafe(weight) {
     return null;
   }
   const result = parseWeightKg(weight);
-  if (Number.isNaN(result)) {
+  if (result == null) {
     logger.warn(`[ML] parseWeightKg received unparseable weight: ${weight}`);
     return null;
   }
@@ -94,8 +97,9 @@ function getHeaders() {
   const headers = {
     'Content-Type': 'application/json',
   };
-  if (process.env.ML_API_KEY) {
-    headers['X-API-Key'] = process.env.ML_API_KEY;
+  const apiKey = (process.env.ML_API_KEY || '').trim();
+  if (apiKey) {
+    headers['X-API-Key'] = apiKey;
   }
   return headers;
 }
@@ -110,7 +114,7 @@ async function handleResponse(response, url = '', method = 'GET') {
         throw new Error(`[ML] Authentication failed (${response.status}): ${method} ${url} - ${text}`);
     }
     if (!response.ok) {
-        throw new Error(`[ML] Request failed (${response.status}): ${method} ${url} - ${text}`);
+        throw new Error(`[ML] Request failed: ${method} ${url} ${response.status} - ${text}`);
     }
 
     try {
@@ -211,12 +215,12 @@ export async function predictPrice({
 
   const adjustedPrice = initialValidation.validated.estimated_price * safeMultiplier;
   // Only forward min_price/max_price keys when the raw response actually
-  // carried them — injecting undefined values trips the response validator.
+  // carried valid finite numbers — injecting undefined/NaN/Infinity trips the response validator.
   const revalidated = validatePricePrediction({
       ...raw,
       estimated_price: adjustedPrice,
-      ...(typeof raw?.min_price === 'number' ? { min_price: raw.min_price * safeMultiplier } : {}),
-      ...(typeof raw?.max_price === 'number' ? { max_price: raw.max_price * safeMultiplier } : {}),
+      ...(Number.isFinite(raw?.min_price) ? { min_price: raw.min_price * safeMultiplier } : {}),
+      ...(Number.isFinite(raw?.max_price) ? { max_price: raw.max_price * safeMultiplier } : {}),
   });
 
   if (!revalidated.ok) {
